@@ -342,10 +342,12 @@ export function ConversationTabs({
             ref={vscodeButtonRef}
             className={cn(
               "ml-auto shrink-0",
-              backend.kind === "cloud" && "pr-1",
+              (backend.kind === "cloud" || backend.kind === "local") && "pr-1",
             )}
           >
-            {backend.kind === "cloud" && <DrawerVSCodeLink />}
+            {(backend.kind === "cloud" || backend.kind === "local") && (
+              <DrawerVSCodeLink />
+            )}
           </div>
         </div>
       </div>

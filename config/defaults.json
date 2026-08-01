@@ -19,6 +19,7 @@
   "ports": {
     "agentServer": 18000,
     "automation": 18001,
+    "vscode": 18002,
     "proxy": 8000
   },
   "paths": {

@@ -7,7 +7,8 @@
 #   2. Automation     on port $AUTOMATION_PORT     (default 18001)
 #   3. Static server  on port $PORT               (default 8000)
 #      Routes /api/automation/* → automation, /api/* → agent-server,
-#      and serves the frontend static build for everything else.
+#      /vscode/* → VS Code Web, and serves the frontend static build for
+#      everything else.
 #   4. (Optional) Public-mode static server on $PUBLIC_MODE_PORT
 #      Same frontend, but with --auth-required (no baked session key).
 #      Used by auth-mode E2E tests. Only started when PUBLIC_MODE_PORT is set.
@@ -16,6 +17,7 @@
 #   PORT                 – Unified entry point port (default: 8000)
 #   AGENT_SERVER_PORT    – Internal agent-server port (default: 18000)
 #   AUTOMATION_PORT      – Internal automation port (default: 18001)
+#   VSCODE_PORT          – Internal VS Code Web sidecar port (default: 18002)
 #   AGENT_CANVAS_BASE_PATH – Static frontend mount path (default: /canvas)
 #   PUBLIC_MODE_PORT     – If set, starts a second static server on this port
 #                          with --auth-required (no session key injected)
@@ -56,6 +58,7 @@ fi
 PORT="${PORT:-${CONFIG_PROXY_PORT:-8000}}"
 AGENT_SERVER_PORT="${AGENT_SERVER_PORT:-${CONFIG_AGENT_SERVER_PORT:-18000}}"
 AUTOMATION_PORT="${AUTOMATION_PORT:-${CONFIG_AUTOMATION_PORT:-18001}}"
+VSCODE_PORT="${VSCODE_PORT:-${CONFIG_VSCODE_PORT:-18002}}"
 AGENT_CANVAS_BASE_PATH="${AGENT_CANVAS_BASE_PATH:-${CONFIG_CANVAS_BASE_PATH:-/canvas}}"
 
 # Persistence paths — keep settings, conversations, bash history under a
@@ -114,6 +117,7 @@ export OPENHANDS_AUTOMATION_API_KEY="${OPENHANDS_AUTOMATION_API_KEY:-${EFFECTIVE
 export AUTOMATION_LOCAL_API_KEY="${AUTOMATION_LOCAL_API_KEY:-${EFFECTIVE_SESSION_KEY}}"
 export AUTOMATION_AGENT_SERVER_API_KEY="${AUTOMATION_AGENT_SERVER_API_KEY:-${EFFECTIVE_SESSION_KEY}}"
 export OPENHANDS_REMOTE_WS_READY_REQUIRED="${OPENHANDS_REMOTE_WS_READY_REQUIRED:-false}"
+export OH_VSCODE_PORT="${OH_VSCODE_PORT:-${VSCODE_PORT}}"
 if [ -z "${AUTOMATION_POSTHOG_API_KEY:-}" ]; then
   if [ -n "${VITE_POSTHOG_API_KEY:-}" ]; then
     export AUTOMATION_POSTHOG_API_KEY="$VITE_POSTHOG_API_KEY"
@@ -265,6 +269,7 @@ node /opt/agent-canvas/static-server.mjs \
   --runtime-services-info "$RUNTIME_SERVICES_INFO" \
   --route "/api/automation=http://127.0.0.1:${AUTOMATION_PORT}" \
   --route "/api=http://127.0.0.1:${AGENT_SERVER_PORT}" \
+  --route "/vscode=http://127.0.0.1:${OH_VSCODE_PORT}" \
   --route "/server_info=http://127.0.0.1:${AGENT_SERVER_PORT}" \
   --route "/sockets=http://127.0.0.1:${AGENT_SERVER_PORT}" \
   --route "/alive=http://127.0.0.1:${AGENT_SERVER_PORT}" \
@@ -292,6 +297,7 @@ if [ -n "${PUBLIC_MODE_PORT:-}" ]; then
     --runtime-services-info "$RUNTIME_SERVICES_INFO" \
     --route "/api/automation=http://127.0.0.1:${AUTOMATION_PORT}" \
     --route "/api=http://127.0.0.1:${AGENT_SERVER_PORT}" \
+    --route "/vscode=http://127.0.0.1:${OH_VSCODE_PORT}" \
     --route "/server_info=http://127.0.0.1:${AGENT_SERVER_PORT}" \
     --route "/sockets=http://127.0.0.1:${AGENT_SERVER_PORT}" \
     --route "/alive=http://127.0.0.1:${AGENT_SERVER_PORT}" \

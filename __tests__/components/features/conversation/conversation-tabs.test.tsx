@@ -510,7 +510,7 @@ describe("ConversationTabs localStorage behavior", () => {
       mockConversationId = REAL_CONVERSATION_ID;
     });
 
-    it("should hide the vscode link when the active backend is local", () => {
+    it("should show the vscode link when the active backend is local", () => {
       // Arrange
       seedActiveBackend({
         id: "local-test",
@@ -526,9 +526,7 @@ describe("ConversationTabs localStorage behavior", () => {
       });
 
       // Assert
-      expect(
-        screen.queryByTestId("drawer-vscode-link"),
-      ).not.toBeInTheDocument();
+      expect(screen.getByTestId("drawer-vscode-link")).toBeInTheDocument();
     });
 
     it("should show the vscode link when the active backend is cloud", () => {
