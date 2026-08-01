@@ -14,6 +14,7 @@ contains the Clerk gate:
 - `CLERK_PUBLISHABLE_KEY=<Clerk publishable key>`
 - `CLERK_JWT_KEY=<Clerk JWT public key PEM>`
 - `CLERK_AUTHORIZED_PARTIES=https://agent.simonsays.hk`
+- `CLERK_ALLOWED_USER_IDS=<your Clerk user id>` for single-user mode
 
 `CLERK_JWT_KEY` is preferred because the static server can verify session tokens
 without a network call. If Railway stores it on one line, replace newlines with
@@ -27,6 +28,9 @@ Optional alternatives:
 - `CLERK_SIGN_IN_PATH=/__clerk/sign-in` overrides the local sign-in route.
 - `CLERK_AUTH_PUBLIC_PATHS=/extra/public/path` appends unauthenticated public
   paths. Keep `/server_info`, `/api`, and `/sockets` protected.
+- `CLERK_ALLOWED_EMAILS=simonwang@hkbu.edu.hk` can enforce single-user mode only
+  if your Clerk session token includes an email claim. Prefer
+  `CLERK_ALLOWED_USER_IDS` because Clerk always includes the user id as `sub`.
 
 Do not add Clerk keys before this code is deployed; older images ignore them.
 
@@ -42,6 +46,8 @@ For the production Clerk application:
 - Copy the publishable key to `CLERK_PUBLISHABLE_KEY`.
 - Copy the JWT public key from API keys to `CLERK_JWT_KEY`, or copy the secret
   key to `CLERK_SECRET_KEY` if using JWKS fetching.
+- For single-user mode, sign in once or inspect the user in Clerk Dashboard, copy
+  the `user_...` id, and set it as `CLERK_ALLOWED_USER_IDS`.
 
 After deployment, unauthenticated browser navigations redirect to the local Clerk
 sign-in page, while unauthenticated API calls receive `401`.

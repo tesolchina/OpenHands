@@ -435,7 +435,10 @@ describe("static-server.mjs", () => {
   });
 
   describe("Clerk auth gate", () => {
-    function createClerkAuthConfig(publicKeyPem: string | Buffer) {
+    function createClerkAuthConfig(
+      publicKeyPem: string | Buffer,
+      overrides: Record<string, unknown> = {},
+    ) {
       return {
         enabled: true,
         publishableKey: "pk_test_example",
@@ -452,6 +455,7 @@ describe("static-server.mjs", () => {
           "/favicon.ico",
           "/robots.txt",
         ],
+        ...overrides,
       };
     }
 
@@ -527,6 +531,65 @@ describe("static-server.mjs", () => {
         sub: "user_test",
         sid: "sess_test",
         azp: origin,
+        nbf: now - 10,
+        exp: now + 300,
+      });
+
+      const response = await fetch(`${origin}/`, {
+        headers: { Cookie: `__session=${encodeURIComponent(token)}` },
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.text()).resolves.toContain("app");
+    });
+
+    it("rejects Clerk sessions from users outside the allowlist", async () => {
+      const buildDir = mkdtempSync(path.join(tmpdir(), "agent-canvas-build-"));
+      tempDirs.push(buildDir);
+      writeFileSync(path.join(buildDir, "index.html"), "<main>app</main>");
+      const { privateKey, publicKeyPem } = createClerkTestKeys();
+
+      const origin = await startServer(buildDir, {
+        clerkAuth: createClerkAuthConfig(publicKeyPem, {
+          allowedUserIds: ["user_allowed"],
+        }),
+      });
+      const now = Math.floor(Date.now() / 1000);
+      const token = signClerkSessionToken(privateKey, {
+        sub: "user_blocked",
+        sid: "sess_test",
+        azp: origin,
+        nbf: now - 10,
+        exp: now + 300,
+      });
+
+      const response = await fetch(`${origin}/`, {
+        headers: { Cookie: `__session=${encodeURIComponent(token)}` },
+      });
+
+      expect(response.status).toBe(401);
+      await expect(response.json()).resolves.toEqual({
+        error: "Authentication required",
+      });
+    });
+
+    it("allows Clerk sessions with an allowlisted email claim", async () => {
+      const buildDir = mkdtempSync(path.join(tmpdir(), "agent-canvas-build-"));
+      tempDirs.push(buildDir);
+      writeFileSync(path.join(buildDir, "index.html"), "<main>app</main>");
+      const { privateKey, publicKeyPem } = createClerkTestKeys();
+
+      const origin = await startServer(buildDir, {
+        clerkAuth: createClerkAuthConfig(publicKeyPem, {
+          allowedEmails: ["simonwang@hkbu.edu.hk"],
+        }),
+      });
+      const now = Math.floor(Date.now() / 1000);
+      const token = signClerkSessionToken(privateKey, {
+        sub: "user_test",
+        sid: "sess_test",
+        azp: origin,
+        email: "SimonWang@HKBU.edu.hk",
         nbf: now - 10,
         exp: now + 300,
       });

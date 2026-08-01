@@ -217,6 +217,10 @@ function readClerkAuthConfigFromEnv(env = process.env) {
     authorizedParties: parseCsvEnv(
       env.CLERK_AUTHORIZED_PARTIES || env.CLERK_ALLOWED_ORIGINS,
     ),
+    allowedUserIds: parseCsvEnv(env.CLERK_ALLOWED_USER_IDS),
+    allowedEmails: parseCsvEnv(env.CLERK_ALLOWED_EMAILS).map((email) =>
+      email.toLowerCase(),
+    ),
     signInPath: normalizePathEnv(
       env.CLERK_SIGN_IN_PATH,
       DEFAULT_CLERK_SIGN_IN_PATH,
@@ -554,6 +558,28 @@ function verifyJwtClaims(payload, req, config) {
     !authorizedParties.includes(payload.azp)
   ) {
     throw new Error("Clerk session token authorized party mismatch");
+  }
+
+  if (
+    config.allowedUserIds?.length > 0 &&
+    !config.allowedUserIds.includes(payload.sub)
+  ) {
+    throw new Error("Clerk session user is not allowed");
+  }
+
+  if (config.allowedEmails?.length > 0) {
+    const emailClaims = [
+      payload.email,
+      payload.email_address,
+      payload.primary_email_address,
+    ].filter((value) => typeof value === "string");
+    const normalizedEmails = emailClaims.map((email) => email.toLowerCase());
+    if (
+      normalizedEmails.length === 0 ||
+      !normalizedEmails.some((email) => config.allowedEmails.includes(email))
+    ) {
+      throw new Error("Clerk session email is not allowed");
+    }
   }
 }
 
