@@ -72,6 +72,5 @@ RUN mkdir -p /home/openhands/.openhands/agent-canvas/conversations \
     chown -R openhands:openhands /home/openhands/.openhands /projects
 
 USER openhands
-VOLUME ["/home/openhands/.openhands", "/projects"]
 EXPOSE 8000
 ENTRYPOINT ["tini", "--", "/opt/agent-canvas/entrypoint.sh"]
