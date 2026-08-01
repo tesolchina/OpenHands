@@ -27,6 +27,7 @@
  *     --route "/sockets=http://localhost:18000"
  */
 
+import { createPublicKey, createVerify } from "node:crypto";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
@@ -39,6 +40,18 @@ import {
   createRouter,
   matchesPathPrefix,
 } from "./proxy-utils.mjs";
+
+const DEFAULT_CLERK_SIGN_IN_PATH = "/__clerk/sign-in";
+const DEFAULT_CLERK_PUBLIC_PATHS = [
+  DEFAULT_CLERK_SIGN_IN_PATH,
+  "/alive",
+  "/health",
+  "/ready",
+  "/favicon.ico",
+  "/robots.txt",
+];
+const DEFAULT_CLERK_JWKS_URL = "https://api.clerk.com/v1/jwks";
+const CLERK_JWKS_CACHE_MS = 5 * 60 * 1000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SPA fallback helpers
@@ -87,6 +100,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
     runtimeServicesInfo: null,
     lockToCloud: null,
     basePath: "/",
+    clerkAuth: readClerkAuthConfigFromEnv(),
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -131,13 +145,16 @@ export function parseArgs(argv = process.argv.slice(2)) {
       case "--base-path":
         config.basePath = normalizeBasePath(argv[++i]);
         break;
+      case "--clerk-auth":
+        config.clerkAuth.enabled = true;
+        break;
 
       case "--auth-required":
         config.authRequired = true;
         break;
       case "--reject-prefix": {
         const prefix = argv[++i];
-        if (!prefix || !prefix.startsWith("/")) {
+        if (!prefix?.startsWith("/")) {
           throw new Error(
             `--reject-prefix value must start with '/': ${prefix ?? "(empty)"}`,
           );
@@ -149,6 +166,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
       case "--help":
         showHelp();
         process.exit(0);
+        break;
       default:
         throw new Error(`Unknown flag: ${flag}`);
     }
@@ -168,6 +186,51 @@ export function parseArgs(argv = process.argv.slice(2)) {
   }
 
   return config;
+}
+
+function parseBooleanEnv(value) {
+  if (value == null || value === "") return false;
+  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
+}
+
+function parseCsvEnv(value) {
+  return (value ?? "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function normalizeMultilineSecret(value) {
+  return value ? value.replaceAll("\\n", "\n") : null;
+}
+
+function readClerkAuthConfigFromEnv(env = process.env) {
+  const enabled = parseBooleanEnv(env.CLERK_AUTH_ENABLED);
+  return {
+    enabled,
+    publishableKey: env.CLERK_PUBLISHABLE_KEY || null,
+    jwtKey: normalizeMultilineSecret(
+      env.CLERK_JWT_KEY || env.CLERK_PEM_PUBLIC_KEY || null,
+    ),
+    secretKey: env.CLERK_SECRET_KEY || null,
+    jwksUrl: env.CLERK_JWKS_URL || DEFAULT_CLERK_JWKS_URL,
+    authorizedParties: parseCsvEnv(
+      env.CLERK_AUTHORIZED_PARTIES || env.CLERK_ALLOWED_ORIGINS,
+    ),
+    signInPath: normalizePathEnv(
+      env.CLERK_SIGN_IN_PATH,
+      DEFAULT_CLERK_SIGN_IN_PATH,
+    ),
+    publicPaths: [
+      ...DEFAULT_CLERK_PUBLIC_PATHS,
+      ...parseCsvEnv(env.CLERK_AUTH_PUBLIC_PATHS),
+    ],
+  };
+}
+
+function normalizePathEnv(value, fallback) {
+  if (!value) return fallback;
+  return value.startsWith("/") ? value : `/${value}`;
 }
 
 function normalizeBasePath(value) {
@@ -209,6 +272,10 @@ OPTIONS:
   --base-path <path>           Mount the SPA under <path> (default: /).
                                For example, --base-path /canvas serves
                                index.html and assets under /canvas.
+  --clerk-auth                 Enable the Clerk server-side gate. Intended for
+                               runtime use with CLERK_AUTH_ENABLED=true,
+                               CLERK_PUBLISHABLE_KEY, and CLERK_JWT_KEY (or
+                               CLERK_SECRET_KEY / CLERK_JWKS_URL).
   --reject-prefix <prefix>     Return 503 for requests matching <prefix>
                                instead of SPA-fallbacking to index.html;
                                may be repeated. Useful in --frontend-only
@@ -225,6 +292,291 @@ ROUTING:
     like an asset request (have a known file extension), in which case
     a 404 is returned.
 `);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Clerk auth gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+function isClerkAuthEnabled(config) {
+  return Boolean(config?.enabled);
+}
+
+function getClerkConfigError(config) {
+  if (!isClerkAuthEnabled(config)) return null;
+  if (!config.publishableKey) return "CLERK_PUBLISHABLE_KEY is required";
+  const hasCustomJwksUrl =
+    config.jwksUrl && config.jwksUrl !== DEFAULT_CLERK_JWKS_URL;
+  if (!config.jwtKey && !config.secretKey && !hasCustomJwksUrl) {
+    return "CLERK_JWT_KEY, CLERK_SECRET_KEY, or CLERK_JWKS_URL is required";
+  }
+  return null;
+}
+
+function parseCookies(cookieHeader = "") {
+  const cookies = new Map();
+  for (const pair of cookieHeader.split(";")) {
+    const index = pair.indexOf("=");
+    if (index < 0) continue;
+    const name = pair.slice(0, index).trim();
+    const value = pair.slice(index + 1).trim();
+    if (name) cookies.set(name, decodeURIComponent(value));
+  }
+  return cookies;
+}
+
+function getSessionToken(req) {
+  const authorization = req.headers.authorization;
+  if (authorization?.toLowerCase().startsWith("bearer ")) {
+    return authorization.slice("bearer ".length).trim();
+  }
+  return parseCookies(req.headers.cookie).get("__session") ?? null;
+}
+
+function base64UrlDecode(value) {
+  const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
+  const padded = normalized.padEnd(
+    normalized.length + ((4 - (normalized.length % 4)) % 4),
+    "=",
+  );
+  return Buffer.from(padded, "base64");
+}
+
+function parseJwt(token) {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("Invalid JWT format");
+  const [encodedHeader, encodedPayload, encodedSignature] = parts;
+  const header = JSON.parse(base64UrlDecode(encodedHeader).toString("utf8"));
+  const payload = JSON.parse(base64UrlDecode(encodedPayload).toString("utf8"));
+  return {
+    header,
+    payload,
+    signingInput: `${encodedHeader}.${encodedPayload}`,
+    signature: base64UrlDecode(encodedSignature),
+  };
+}
+
+function getRequestOrigin(req) {
+  const protoHeader = req.headers["x-forwarded-proto"];
+  const hostHeader = req.headers["x-forwarded-host"] ?? req.headers.host;
+  const proto = Array.isArray(protoHeader)
+    ? protoHeader[0]
+    : protoHeader || "http";
+  const host = Array.isArray(hostHeader) ? hostHeader[0] : hostHeader;
+  return host ? `${proto}://${host}` : null;
+}
+
+function isHtmlNavigation(req) {
+  const method = req.method ?? "GET";
+  if (method !== "GET" && method !== "HEAD") return false;
+  const accept = req.headers.accept ?? "";
+  return accept.includes("text/html");
+}
+
+function isPublicClerkPath(urlPath, config) {
+  return (config.publicPaths ?? DEFAULT_CLERK_PUBLIC_PATHS).some((prefix) =>
+    matchesPathPrefix(urlPath, prefix),
+  );
+}
+
+function writeAuthConfigError(res, message) {
+  res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end(`Clerk auth is misconfigured: ${message}`);
+}
+
+function writeUnauthorized(req, res, config) {
+  if (isHtmlNavigation(req)) {
+    const origin = getRequestOrigin(req) ?? "";
+    const redirectUrl = `${origin}${req.url ?? "/"}`;
+    const location =
+      `${config.signInPath ?? DEFAULT_CLERK_SIGN_IN_PATH}` +
+      `?redirect_url=${encodeURIComponent(redirectUrl)}`;
+    res.writeHead(302, { Location: location, "Cache-Control": "no-store" });
+    res.end();
+    return;
+  }
+
+  res.writeHead(401, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(JSON.stringify({ error: "Authentication required" }));
+}
+
+function writeUnauthorizedSocket(socket) {
+  socket.write(
+    "HTTP/1.1 401 Unauthorized\r\n" +
+      "Connection: close\r\n" +
+      "Content-Type: text/plain; charset=utf-8\r\n" +
+      "\r\n" +
+      "Authentication required",
+  );
+  socket.destroy();
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function serveClerkSignInPage(req, res, config) {
+  const origin = getRequestOrigin(req) ?? "";
+  const currentUrl = new URL(req.url ?? "/", origin || "http://localhost");
+  const redirectUrl = currentUrl.searchParams.get("redirect_url") || "/";
+  const publishableKey = escapeHtml(config.publishableKey);
+  const safeRedirectUrl = escapeHtml(redirectUrl);
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in</title>
+  <script async crossorigin="anonymous" data-clerk-publishable-key="${publishableKey}" src="https://cdn.jsdelivr.net/npm/@clerk/clerk-js@5/dist/clerk.browser.js"></script>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0b0f19; color: #f8fafc; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width: min(440px, calc(100vw - 32px)); }
+    h1 { margin: 0 0 16px; font-size: 1.5rem; text-align: center; }
+    p { margin: 0 0 24px; color: #cbd5e1; text-align: center; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Sign in to Agent Canvas</h1>
+    <p>Use your approved Google account to continue.</p>
+    <div id="clerk-sign-in"></div>
+  </main>
+  <script>
+    (async function () {
+      var redirectUrl = "${safeRedirectUrl}";
+      function fail(error) {
+        document.getElementById("clerk-sign-in").textContent =
+          "Unable to load Clerk sign-in. Check the Clerk publishable key and allowed origins.";
+        console.error(error);
+      }
+      try {
+        await window.Clerk.load();
+        if (window.Clerk.user) {
+          window.location.assign(redirectUrl);
+          return;
+        }
+        window.Clerk.mountSignIn(document.getElementById("clerk-sign-in"), {
+          fallbackRedirectUrl: redirectUrl,
+          forceRedirectUrl: redirectUrl,
+          signUpFallbackRedirectUrl: redirectUrl,
+          signUpForceRedirectUrl: redirectUrl
+        });
+      } catch (error) {
+        fail(error);
+      }
+    }());
+  </script>
+</body>
+</html>`;
+
+  const buf = Buffer.from(html, "utf8");
+  res.writeHead(200, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Content-Length": buf.length,
+    "Cache-Control": "no-store",
+  });
+  if (req.method === "HEAD") {
+    res.end();
+  } else {
+    res.end(buf);
+  }
+}
+
+function createClerkKeyResolver(config) {
+  let cachedJwks = null;
+  let cachedAt = 0;
+
+  async function fetchJwks() {
+    const now = Date.now();
+    if (cachedJwks && now - cachedAt < CLERK_JWKS_CACHE_MS) {
+      return cachedJwks;
+    }
+
+    const headers = config.secretKey
+      ? { Authorization: `Bearer ${config.secretKey}` }
+      : {};
+    const response = await fetch(config.jwksUrl || DEFAULT_CLERK_JWKS_URL, {
+      headers,
+    });
+    if (!response.ok) {
+      throw new Error(`Unable to fetch Clerk JWKS (${response.status})`);
+    }
+    cachedJwks = await response.json();
+    cachedAt = now;
+    return cachedJwks;
+  }
+
+  return async function resolvePublicKey(kid) {
+    if (config.jwtKey) return createPublicKey(config.jwtKey);
+
+    const jwks = await fetchJwks();
+    const keys = Array.isArray(jwks.keys) ? jwks.keys : [];
+    const key = keys.find((candidate) => !kid || candidate.kid === kid);
+    if (!key) throw new Error("No matching Clerk JWKS key");
+    return createPublicKey({ key, format: "jwk" });
+  };
+}
+
+function verifyJwtSignature(signingInput, signature, publicKey) {
+  const verifier = createVerify("RSA-SHA256");
+  verifier.update(signingInput);
+  verifier.end();
+  return verifier.verify(publicKey, signature);
+}
+
+function verifyJwtClaims(payload, req, config) {
+  const now = Math.floor(Date.now() / 1000);
+  if (typeof payload.exp !== "number" || payload.exp <= now) {
+    throw new Error("Clerk session token expired");
+  }
+  if (typeof payload.nbf === "number" && payload.nbf > now) {
+    throw new Error("Clerk session token not active yet");
+  }
+
+  const requestOrigin = getRequestOrigin(req);
+  const authorizedParties =
+    config.authorizedParties?.length > 0
+      ? config.authorizedParties
+      : requestOrigin
+        ? [requestOrigin]
+        : [];
+  if (
+    authorizedParties.length > 0 &&
+    typeof payload.azp === "string" &&
+    !authorizedParties.includes(payload.azp)
+  ) {
+    throw new Error("Clerk session token authorized party mismatch");
+  }
+}
+
+function createClerkAuthenticator(config) {
+  const resolvePublicKey = createClerkKeyResolver(config);
+
+  return async function authenticateClerkRequest(req) {
+    const token = getSessionToken(req);
+    if (!token) return false;
+
+    const { header, payload, signingInput, signature } = parseJwt(token);
+    if (header.alg !== "RS256") {
+      throw new Error("Unsupported Clerk JWT algorithm");
+    }
+
+    const publicKey = await resolvePublicKey(header.kid);
+    if (!verifyJwtSignature(signingInput, signature, publicKey)) {
+      throw new Error("Invalid Clerk session token signature");
+    }
+
+    verifyJwtClaims(payload, req, config);
+    return true;
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -542,6 +894,11 @@ export function startStaticServer(config) {
   const route = createRouter(config.routes);
   const proxy = createProxyHandlers({ label: `static:${config.port}` });
   const dirAbs = resolve(config.dir);
+  const clerkAuth = config.clerkAuth ?? { enabled: false };
+  const clerkConfigError = getClerkConfigError(clerkAuth);
+  const authenticateClerkRequest = isClerkAuthEnabled(clerkAuth)
+    ? createClerkAuthenticator(clerkAuth)
+    : null;
   const injectionOpts = {
     sessionApiKey: config.sessionApiKey || null,
     authRequired: config.authRequired || false,
@@ -556,20 +913,61 @@ export function startStaticServer(config) {
   const uninstallDiagnostics = proxy.installDiagnostics();
 
   const server = createServer((req, res) => {
-    const backend = route(req.url ?? "/");
-    if (backend) {
-      proxy.proxyHttp(req, res, backend);
-      return;
-    }
-    handleStatic(
-      req,
-      res,
-      dirAbs,
-      staticMiddleware,
-      injectionOpts,
-      rejectPrefixes,
-      basePath,
-    ).catch((err) => {
+    (async () => {
+      const urlPath = parseUrlPath(req, res);
+      if (urlPath === null) return;
+
+      if (
+        isClerkAuthEnabled(clerkAuth) &&
+        urlPath === (clerkAuth.signInPath ?? DEFAULT_CLERK_SIGN_IN_PATH)
+      ) {
+        if (clerkConfigError) {
+          writeAuthConfigError(res, clerkConfigError);
+          return;
+        }
+        serveClerkSignInPage(req, res, clerkAuth);
+        return;
+      }
+
+      if (
+        isClerkAuthEnabled(clerkAuth) &&
+        !isPublicClerkPath(urlPath, clerkAuth)
+      ) {
+        if (clerkConfigError) {
+          writeAuthConfigError(res, clerkConfigError);
+          return;
+        }
+        try {
+          if (!(await authenticateClerkRequest(req))) {
+            writeUnauthorized(req, res, clerkAuth);
+            return;
+          }
+        } catch (err) {
+          console.warn(
+            `Clerk auth rejected ${req.method ?? "GET"} ${req.url}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          writeUnauthorized(req, res, clerkAuth);
+          return;
+        }
+      }
+
+      const backend = route(req.url ?? "/");
+      if (backend) {
+        proxy.proxyHttp(req, res, backend);
+        return;
+      }
+      await handleStatic(
+        req,
+        res,
+        dirAbs,
+        staticMiddleware,
+        injectionOpts,
+        rejectPrefixes,
+        basePath,
+      );
+    })().catch((err) => {
       console.error(`Static handler error for ${req.url}:`, err);
       if (!res.headersSent) {
         res.writeHead(500);
@@ -579,12 +977,60 @@ export function startStaticServer(config) {
   });
 
   server.on("upgrade", (req, socket, head) => {
-    const backend = route(req.url ?? "/");
-    if (backend) {
-      proxy.proxyWebSocket(req, socket, head, backend);
-      return;
-    }
-    socket.destroy();
+    (async () => {
+      const urlPath = (() => {
+        try {
+          return decodeURIComponent((req.url ?? "/").split("?")[0]);
+        } catch {
+          return null;
+        }
+      })();
+      if (urlPath === null) {
+        socket.destroy();
+        return;
+      }
+
+      if (
+        isClerkAuthEnabled(clerkAuth) &&
+        !isPublicClerkPath(urlPath, clerkAuth)
+      ) {
+        if (clerkConfigError) {
+          socket.write(
+            "HTTP/1.1 503 Service Unavailable\r\n" +
+              "Connection: close\r\n" +
+              "Content-Type: text/plain; charset=utf-8\r\n" +
+              "\r\n" +
+              `Clerk auth is misconfigured: ${clerkConfigError}`,
+          );
+          socket.destroy();
+          return;
+        }
+        try {
+          if (!(await authenticateClerkRequest(req))) {
+            writeUnauthorizedSocket(socket);
+            return;
+          }
+        } catch (err) {
+          console.warn(
+            `Clerk auth rejected websocket ${req.url}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          writeUnauthorizedSocket(socket);
+          return;
+        }
+      }
+
+      const backend = route(req.url ?? "/");
+      if (backend) {
+        proxy.proxyWebSocket(req, socket, head, backend);
+        return;
+      }
+      socket.destroy();
+    })().catch((err) => {
+      console.error(`Static websocket handler error for ${req.url}:`, err);
+      socket.destroy();
+    });
   });
   server.on("close", uninstallDiagnostics);
 
@@ -610,6 +1056,11 @@ export function startStaticServer(config) {
       }
       if (config.lockToCloud) {
         console.log(`  Backend setup locked to Cloud: ${config.lockToCloud}`);
+      }
+      if (isClerkAuthEnabled(clerkAuth)) {
+        console.log(
+          `  Clerk auth: enabled (${clerkAuth.signInPath ?? DEFAULT_CLERK_SIGN_IN_PATH})`,
+        );
       }
       console.log("  * (default) -> static files + SPA fallback");
       console.log("");

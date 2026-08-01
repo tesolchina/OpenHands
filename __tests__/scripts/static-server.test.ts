@@ -1,4 +1,5 @@
 import type { Server } from "node:http";
+import { createSign, generateKeyPairSync } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -44,6 +45,36 @@ describe("static-server.mjs", () => {
     }
 
     return `http://127.0.0.1:${address.port}`;
+  }
+
+  function createClerkTestKeys() {
+    const { privateKey, publicKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+    });
+
+    return {
+      privateKey,
+      publicKeyPem: publicKey.export({ type: "spki", format: "pem" }),
+    };
+  }
+
+  function encodeJwtPart(value: unknown) {
+    return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+  }
+
+  function signClerkSessionToken(
+    privateKey: ReturnType<typeof createClerkTestKeys>["privateKey"],
+    payload: Record<string, unknown>,
+  ) {
+    const header = encodeJwtPart({ alg: "RS256", typ: "JWT" });
+    const body = encodeJwtPart(payload);
+    const signingInput = `${header}.${body}`;
+    const signer = createSign("RSA-SHA256");
+    signer.update(signingInput);
+    signer.end();
+    const signature = signer.sign(privateKey).toString("base64url");
+
+    return `${signingInput}.${signature}`;
   }
 
   describe("parseArgs", () => {
@@ -400,6 +431,112 @@ describe("static-server.mjs", () => {
       // Script should appear before </body>, not at the very front of the document
       expect(body.indexOf("no-head-key")).toBeLessThan(body.indexOf("</body>"));
       expect(body.indexOf("no-head-key")).toBeGreaterThan(0);
+    });
+  });
+
+  describe("Clerk auth gate", () => {
+    function createClerkAuthConfig(publicKeyPem: string | Buffer) {
+      return {
+        enabled: true,
+        publishableKey: "pk_test_example",
+        jwtKey: String(publicKeyPem),
+        secretKey: null,
+        jwksUrl: "https://api.clerk.com/v1/jwks",
+        authorizedParties: [],
+        signInPath: "/__clerk/sign-in",
+        publicPaths: [
+          "/__clerk/sign-in",
+          "/alive",
+          "/health",
+          "/ready",
+          "/favicon.ico",
+          "/robots.txt",
+        ],
+      };
+    }
+
+    it("redirects unauthenticated HTML navigations to Clerk sign-in", async () => {
+      const buildDir = mkdtempSync(path.join(tmpdir(), "agent-canvas-build-"));
+      tempDirs.push(buildDir);
+      writeFileSync(path.join(buildDir, "index.html"), "<main>app</main>");
+      const { publicKeyPem } = createClerkTestKeys();
+
+      const origin = await startServer(buildDir, {
+        clerkAuth: createClerkAuthConfig(publicKeyPem),
+      });
+      const response = await fetch(`${origin}/`, {
+        headers: { Accept: "text/html" },
+        redirect: "manual",
+      });
+
+      expect(response.status).toBe(302);
+      expect(response.headers.get("location")).toContain(
+        "/__clerk/sign-in?redirect_url=",
+      );
+    });
+
+    it("rejects unauthenticated backend requests before proxying", async () => {
+      const buildDir = mkdtempSync(path.join(tmpdir(), "agent-canvas-build-"));
+      tempDirs.push(buildDir);
+      writeFileSync(path.join(buildDir, "index.html"), "<main>app</main>");
+      const { publicKeyPem } = createClerkTestKeys();
+
+      const origin = await startServer(buildDir, {
+        routes: { "/protected-proxy": "http://127.0.0.1:9" },
+        clerkAuth: createClerkAuthConfig(publicKeyPem),
+      });
+      const response = await fetch(`${origin}/protected-proxy`, {
+        redirect: "manual",
+      });
+
+      expect(response.status).toBe(401);
+      await expect(response.json()).resolves.toEqual({
+        error: "Authentication required",
+      });
+    });
+
+    it("serves the Clerk sign-in page as a public path", async () => {
+      const buildDir = mkdtempSync(path.join(tmpdir(), "agent-canvas-build-"));
+      tempDirs.push(buildDir);
+      writeFileSync(path.join(buildDir, "index.html"), "<main>app</main>");
+      const { publicKeyPem } = createClerkTestKeys();
+
+      const origin = await startServer(buildDir, {
+        clerkAuth: createClerkAuthConfig(publicKeyPem),
+      });
+      const response = await fetch(`${origin}/__clerk/sign-in`);
+      const body = await response.text();
+
+      expect(response.status).toBe(200);
+      expect(body).toContain("Sign in to Agent Canvas");
+      expect(body).toContain("pk_test_example");
+      expect(body).toContain("@clerk/clerk-js");
+    });
+
+    it("allows requests with a valid Clerk session cookie", async () => {
+      const buildDir = mkdtempSync(path.join(tmpdir(), "agent-canvas-build-"));
+      tempDirs.push(buildDir);
+      writeFileSync(path.join(buildDir, "index.html"), "<main>app</main>");
+      const { privateKey, publicKeyPem } = createClerkTestKeys();
+
+      const origin = await startServer(buildDir, {
+        clerkAuth: createClerkAuthConfig(publicKeyPem),
+      });
+      const now = Math.floor(Date.now() / 1000);
+      const token = signClerkSessionToken(privateKey, {
+        sub: "user_test",
+        sid: "sess_test",
+        azp: origin,
+        nbf: now - 10,
+        exp: now + 300,
+      });
+
+      const response = await fetch(`${origin}/`, {
+        headers: { Cookie: `__session=${encodeURIComponent(token)}` },
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.text()).resolves.toContain("app");
     });
   });
 
